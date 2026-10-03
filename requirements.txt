@@ -1,0 +1,8 @@
+telethon==1.36.0
+python-telegram-bot==21.6
+pybit==5.8.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+anthropic==1.11.0
+aiosqlite==0.20.0
+python-dotenv==1.0.1

@@ -1,0 +1,12 @@
+.env
+*.session
+*.session-journal
+__pycache__/
+*.pyc
+logs/*
+!logs/.gitkeep
+*.sqlite
+*.db
+.venv/
+venv/
+.pytest_cache/
