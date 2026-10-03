@@ -1,108 +1,108 @@
+<div align="center">
+
 # signal-copier
 
-Mirrors trade signals from one or more Telegram sources (including forum
-supergroup topics) onto Bybit USDT perpetuals, with risk-based sizing and full
-trade management. Three gated run modes: **DRY_RUN → TESTNET → LIVE**.
+**Copies trade signals from Telegram channels to Bybit USDT perpetuals — with risk-based sizing, full trade management and a kill-switch.**
 
-Stack: async Python, Telethon, python-telegram-bot, pybit v5, pydantic v2,
-aiosqlite, Claude Haiku as a fallback parser.
+[![CI](https://github.com/faceitall123qwe-hub/signal-copier/actions/workflows/ci.yml/badge.svg)](https://github.com/faceitall123qwe-hub/signal-copier/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white)
+![asyncio](https://img.shields.io/badge/asyncio-async_I%2FO-3776AB)
+![Pydantic](https://img.shields.io/badge/Pydantic_v2-E92063?logo=pydantic&logoColor=white)
+![Telegram](https://img.shields.io/badge/Telethon-26A5E4?logo=telegram&logoColor=white)
+![Bybit](https://img.shields.io/badge/Bybit_v5-F7A600)
 
-## Try it without any keys
+</div>
+
+---
+
+## Try it in 30 seconds — no API keys
 
 ```bash
 pip install -r requirements.txt pytest
-python demo.py      # scripted signals -> full pipeline -> in-memory exchange
+python demo.py      # scripted signals → real pipeline → in-memory exchange
 pytest -q           # 31 tests, no network
 ```
 
-`demo.py` drives the real parser, risk guard, sizing and executor against
-`exchange/mock_exchange.py` — an in-memory exchange with the same async
-interface as `BybitClient`. It shows limit entry → fill → SL + TP ladder,
-TP1 → SL to breakeven, duplicate-message idempotency, market close with
-realised PnL, and the `/panic` kill-switch blocking new entries.
+```text
+>>> message #1: LONG BTCUSDT Entry: 64000 SL: 63000 TP1: 65000 TP2: 66000
+  🟢 ENTRY BTCUSDT long qty=0.1 @ 64000.0 | SL=63000.0 TP=[65000.0, 66000.0]
+>>> exchange: fill entry
+  🎯 SL+TP set BTCUSDT: SL=63000.0 TP=[65000.0, 66000.0]
+>>> exchange: fill tp1
+  ✂️ PARTIAL CLOSE BTCUSDT leg filled @ 65000.0
+  🟰 SL -> breakeven BTCUSDT after TP1
+>>> message #3: (same message delivered again)
+  executor: duplicate entry — skipping
+>>> message #4: thinking about going long on bitcoin soon maybe
+  (regex miss -> would go to LLM parser)
+>>> operator: /panic
+>>> message #6: LONG SOLUSDT Entry: 150 SL: 145 TP: 165
+  ⏭️ SKIP SOLUSDT: panic active (use /resume)
+```
+
+`demo.py` runs the **real** parser, risk guard, sizing and executor against
+[`exchange/mock_exchange.py`](exchange/mock_exchange.py) — an in-memory exchange with the
+same async interface as the Bybit client, which also emits the fill events the private
+WebSocket would.
 
 ## How it works
 
-```
-N sources ─(Telethon userbot)─> parse (regex fast-path → Claude Haiku fallback)
-  → ParsedSignal{intent,symbol,side,entries,sl,tps,leverage,close_pct,confidence}
-  confidence < MIN_CONFIDENCE ─► ping control bot, await /confirm | /reject
-  else route ▼
-  Risk guard │ Sizing (risk-to-SL) │ Bybit executor │ SQLite state │ Notifier
-Bybit private WS (order/position/execution) ─► state machine
-  (TP1 filled → SL to breakeven; entry-fill timeout; realized PnL)
-Control bot: /status /positions /pnl /pause /resume /panic /risk /mode
-             /confirm /reject /sources
+```mermaid
+flowchart LR
+    S[Telegram channels<br/>+ forum topics] -->|Telethon userbot| P{Parser}
+    P -->|regex fast-path<br/>EN / RU / PL| SIG[ParsedSignal<br/>pydantic v2]
+    P -.miss.-> LLM[Claude Haiku<br/>JSON + few-shot] --> SIG
+    SIG -->|confidence < 0.75| Q[/confirm · /reject/]
+    SIG --> R[Risk guard<br/>panic · pause · daily loss · max positions]
+    R --> Z[Sizing<br/>risk-to-SL, leverage cap]
+    Z --> X[Executor] --> B[(Bybit v5<br/>or MockExchange)]
+    B -->|private WS fills| X
+    X --> DB[(SQLite state)]
+    X --> N[Control bot<br/>notifications]
 ```
 
-Two Telegram identities:
-- **Telethon userbot** on a *secondary* account that is a member of every source
-  channel — reads the signals (Bot API cannot read third-party channels).
-- **Control bot** (your own bot token) — how you command the copier.
+**Trade lifecycle:** limit/market entry → on fill attach SL + split TP ladder → TP1 fill moves
+SL to breakeven → management messages (move SL, replace TPs, partial / full close) are matched
+to the right trade by source channel + topic, never across channels.
 
 ## Safety model
 
-- **DRY_RUN** (default): parse + log only, zero orders.
-- **TESTNET**: places orders on Bybit testnet.
-- **LIVE**: refuses to start unless `MODE=LIVE` **and** `CONFIRM_LIVE=I_UNDERSTAND`.
-- Idempotent `orderLinkId = sha1(source_channel_id:message_id)` → restarts and
-  duplicate messages never double-fire.
-- Isolated margin, leverage capped so the SL always triggers before liquidation.
-- `/panic` cancels + flattens everything and refuses new entries until `/resume`.
-- Max concurrent positions + max-daily-loss halt.
-- Secrets only in `.env`; `.env` and `*.session` are gitignored and never logged.
+| Guard | Behaviour |
+|---|---|
+| **DRY_RUN by default** | Parses and logs only; TESTNET and LIVE are explicit modes |
+| **LIVE gate** | Refuses to start unless `MODE=LIVE` **and** `CONFIRM_LIVE=I_UNDERSTAND` |
+| **Idempotency** | `orderLinkId = sha1(channel_id:message_id)` — restarts and re-delivered messages never double-fire |
+| **Liquidation-safe leverage** | Size comes from risk-to-SL only; leverage is capped so the stop always triggers before liquidation |
+| **Kill-switch** | `/panic` cancels and flattens everything and blocks new entries until `/resume` |
+| **Circuit breakers** | Max concurrent positions, max daily loss halt |
+| **Low-confidence signals** | Held for a human `/confirm` instead of being traded |
+| **Secrets** | Only in `.env`; third-party loggers silenced so tokens never reach logs |
 
-## Setup
+## Control bot
 
-```bash
-cd signal-copier
-python -m venv .venv
-.venv\Scripts\activate            # Windows
-pip install -r requirements.txt
-copy .env.example .env            # then fill it in
+`/status` `/positions` `/pnl` `/pause` `/resume` `/panic` `/risk` `/mode` `/confirm` `/reject` `/sources`
+— accepted only from the configured owner ID.
+
+## Project layout
+
+```
+parser/       regex fast-path, LLM fallback, pydantic schema, few-shot examples
+core/         executor (routing + state machine), risk guard, trade state, notifier
+exchange/     Bybit v5 client (sync SDK offloaded to threads), sizing, MockExchange
+storage/      aiosqlite persistence: trades, processed messages, PnL log
+tests/        parser, sizing, state, end-to-end executor on MockExchange
 ```
 
-Fill `parser/examples.py` with real messages from each sub-channel (+ one
-management message) and their expected JSON — this anchors the LLM parser.
-
-### Generate the Telethon session (secondary account)
+## Running for real
 
 ```bash
-python generate_session.py        # prompts for phone + login code (+2FA)
+cp .env.example .env                 # Telegram API, control bot token, Bybit keys, Anthropic key
+python generate_session.py           # Telethon session for a secondary account in the source channels
+python main.py                       # MODE=DRY_RUN → TESTNET → LIVE
 ```
 
-### Run
+Fill `parser/examples.py` with real messages from your sources to anchor the LLM parser.
+Two Telegram identities are used: a userbot that *reads* channels (the Bot API can't read
+third-party channels) and your own control bot that *commands* the copier.
 
-```bash
-# 1) DRY_RUN — no orders, just parse + log + notify
-#    MODE=DRY_RUN in .env
-python main.py
-
-# 2) TESTNET — real orders on Bybit testnet
-#    MODE=TESTNET, BYBIT_TESTNET=true, testnet API keys
-python main.py
-
-# 3) LIVE — real money. Only after testnet looks correct.
-#    MODE=LIVE, CONFIRM_LIVE=I_UNDERSTAND, BYBIT_TESTNET=false, mainnet keys
-python main.py
-```
-
-### Tests
-
-```bash
-pip install pytest
-pytest -q
-```
-
-- `tests/test_parser.py` — regex fast-path (EN/RU/PL shapes, symbol extraction)
-- `tests/test_sizing.py` — risk-to-SL sizing, leverage cap vs liquidation
-- `tests/test_state.py` — idempotent order links, scoped management matching
-- `tests/test_executor_mock.py` — end-to-end trade lifecycle on `MockExchange`
-
-## Notes / verify against installed libs
-
-- `pybit` v5 `unified_trading.HTTP` / `WebSocket` and `telethon` attribute names
-  (`reply_to.reply_to_top_id`, `GetForumTopicsRequest`) can change between
-  versions — pinned in `requirements.txt`; re-verify if you upgrade.
-- One Bybit account nets per symbol in one-way mode; `ON_SYMBOL_COLLISION`
-  controls behaviour when a symbol already has an open position.
+> Not financial advice. Trading perpetual futures can lose more than the stake; run on testnet first.
