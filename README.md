@@ -1,108 +1,89 @@
-<div align="center">
-
 # signal-copier
 
-**Copies trade signals from Telegram channels to Bybit USDT perpetuals — with risk-based sizing, full trade management and a kill-switch.**
+[![ci](https://github.com/faceitall123qwe-hub/signal-copier/actions/workflows/ci.yml/badge.svg)](https://github.com/faceitall123qwe-hub/signal-copier/actions/workflows/ci.yml)
 
-[![CI](https://github.com/faceitall123qwe-hub/signal-copier/actions/workflows/ci.yml/badge.svg)](https://github.com/faceitall123qwe-hub/signal-copier/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white)
-![asyncio](https://img.shields.io/badge/asyncio-async_I%2FO-3776AB)
-![Pydantic](https://img.shields.io/badge/Pydantic_v2-E92063?logo=pydantic&logoColor=white)
-![Telegram](https://img.shields.io/badge/Telethon-26A5E4?logo=telegram&logoColor=white)
-![Bybit](https://img.shields.io/badge/Bybit_v5-F7A600)
+Reads trade signals from Telegram channels and places them on Bybit (USDT perpetuals). It
+manages the whole trade: entry, stop loss, a take-profit ladder, moving the stop to breakeven
+after TP1, and partial or full closes when the channel posts a follow-up.
 
-</div>
+It starts in `DRY_RUN`. It only trades real money with `MODE=LIVE` **and**
+`CONFIRM_LIVE=I_UNDERSTAND`.
 
----
-
-## Try it in 30 seconds — no API keys
+## Trying it without any keys
 
 ```bash
 pip install -r requirements.txt pytest
-python demo.py      # scripted signals → real pipeline → in-memory exchange
-pytest -q           # 31 tests, no network
+python demo.py
+pytest -q
 ```
+
+`demo.py` pushes a few scripted messages through the real parser, risk checks, sizing and
+executor, against an in-memory exchange (`exchange/mock_exchange.py`) that has the same
+interface as the Bybit client. Shortened output:
 
 ```text
 >>> message #1: LONG BTCUSDT Entry: 64000 SL: 63000 TP1: 65000 TP2: 66000
-  🟢 ENTRY BTCUSDT long qty=0.1 @ 64000.0 | SL=63000.0 TP=[65000.0, 66000.0]
+  ENTRY BTCUSDT long qty=0.1 @ 64000.0 | SL=63000.0 TP=[65000.0, 66000.0]
 >>> exchange: fill entry
-  🎯 SL+TP set BTCUSDT: SL=63000.0 TP=[65000.0, 66000.0]
+  SL+TP set BTCUSDT: SL=63000.0 TP=[65000.0, 66000.0]
 >>> exchange: fill tp1
-  ✂️ PARTIAL CLOSE BTCUSDT leg filled @ 65000.0
-  🟰 SL -> breakeven BTCUSDT after TP1
->>> message #3: (same message delivered again)
-  executor: duplicate entry — skipping
->>> message #4: thinking about going long on bitcoin soon maybe
-  (regex miss -> would go to LLM parser)
+  PARTIAL CLOSE BTCUSDT leg filled @ 65000.0
+  SL -> breakeven BTCUSDT after TP1
+>>> message #3: (the first message again)
+  duplicate entry, skipping
 >>> operator: /panic
 >>> message #6: LONG SOLUSDT Entry: 150 SL: 145 TP: 165
-  ⏭️ SKIP SOLUSDT: panic active (use /resume)
+  SKIP SOLUSDT: panic active (use /resume)
 ```
-
-`demo.py` runs the **real** parser, risk guard, sizing and executor against
-[`exchange/mock_exchange.py`](exchange/mock_exchange.py) — an in-memory exchange with the
-same async interface as the Bybit client, which also emits the fill events the private
-WebSocket would.
 
 ## How it works
 
-```mermaid
-flowchart LR
-    S[Telegram channels<br/>+ forum topics] -->|Telethon userbot| P{Parser}
-    P -->|regex fast-path<br/>EN / RU / PL| SIG[ParsedSignal<br/>pydantic v2]
-    P -.miss.-> LLM[Claude Haiku<br/>JSON + few-shot] --> SIG
-    SIG -->|confidence < 0.75| Q[/confirm · /reject/]
-    SIG --> R[Risk guard<br/>panic · pause · daily loss · max positions]
-    R --> Z[Sizing<br/>risk-to-SL, leverage cap]
-    Z --> X[Executor] --> B[(Bybit v5<br/>or MockExchange)]
-    B -->|private WS fills| X
-    X --> DB[(SQLite state)]
-    X --> N[Control bot<br/>notifications]
-```
+Messages come in through a Telethon user account, because bots can't read channels they don't
+own. A separate bot that I control is used for commands and notifications.
 
-**Trade lifecycle:** limit/market entry → on fill attach SL + split TP ladder → TP1 fill moves
-SL to breakeven → management messages (move SL, replace TPs, partial / full close) are matched
-to the right trade by source channel + topic, never across channels.
+Parsing tries regular expressions first (English, Russian and Polish wording). If they don't
+match with enough confidence, the message goes to Claude Haiku with a set of examples from the
+real channels. Anything below 0.75 confidence is held until I reply `/confirm` or `/reject`.
 
-## Safety model
+Position size comes from risk, not leverage: `equity * RISK_PCT / distance to stop`. Leverage
+only changes the margin, and it's capped so the liquidation price is always past the stop.
 
-| Guard | Behaviour |
-|---|---|
-| **DRY_RUN by default** | Parses and logs only; TESTNET and LIVE are explicit modes |
-| **LIVE gate** | Refuses to start unless `MODE=LIVE` **and** `CONFIRM_LIVE=I_UNDERSTAND` |
-| **Idempotency** | `orderLinkId = sha1(channel_id:message_id)` — restarts and re-delivered messages never double-fire |
-| **Liquidation-safe leverage** | Size comes from risk-to-SL only; leverage is capped so the stop always triggers before liquidation |
-| **Kill-switch** | `/panic` cancels and flattens everything and blocks new entries until `/resume` |
-| **Circuit breakers** | Max concurrent positions, max daily loss halt |
-| **Low-confidence signals** | Held for a human `/confirm` instead of being traded |
-| **Secrets** | Only in `.env`; third-party loggers silenced so tokens never reach logs |
+Every order gets `orderLinkId = hash(channel_id, message_id)`. A restart or a message delivered
+twice can't open a second position.
 
-## Control bot
+Fills come back over Bybit's private WebSocket and move the trade through its states, which
+are stored in SQLite. Follow-up messages ("move SL to BE", "close half") are matched to a trade
+from the same channel and topic, never across channels.
 
-`/status` `/positions` `/pnl` `/pause` `/resume` `/panic` `/risk` `/mode` `/confirm` `/reject` `/sources`
-— accepted only from the configured owner ID.
+Other limits: max open positions, max daily loss, and `/panic`, which cancels all orders,
+closes all positions and blocks new entries until `/resume`.
 
-## Project layout
+## Commands
+
+`/status` `/positions` `/pnl` `/pause` `/resume` `/panic` `/risk` `/mode` `/confirm` `/reject`
+`/sources`. Only the configured Telegram user ID can use them.
+
+## Layout
 
 ```
-parser/       regex fast-path, LLM fallback, pydantic schema, few-shot examples
-core/         executor (routing + state machine), risk guard, trade state, notifier
-exchange/     Bybit v5 client (sync SDK offloaded to threads), sizing, MockExchange
-storage/      aiosqlite persistence: trades, processed messages, PnL log
-tests/        parser, sizing, state, end-to-end executor on MockExchange
+parser/     regex parser, LLM fallback, signal schema (pydantic), examples
+core/       executor and trade states, risk guard, notifications
+exchange/   Bybit client, position sizing, mock exchange
+storage/    SQLite (aiosqlite)
+tests/      parser, sizing, state matching, full trade flow on the mock exchange
 ```
 
-## Running for real
+## Running it for real
 
 ```bash
-cp .env.example .env                 # Telegram API, control bot token, Bybit keys, Anthropic key
-python generate_session.py           # Telethon session for a secondary account in the source channels
-python main.py                       # MODE=DRY_RUN → TESTNET → LIVE
+cp .env.example .env         # Telegram API, control bot token, Bybit and Anthropic keys
+python generate_session.py   # log in the Telethon account
+python main.py               # DRY_RUN, then TESTNET, then LIVE
 ```
 
-Fill `parser/examples.py` with real messages from your sources to anchor the LLM parser.
-Two Telegram identities are used: a userbot that *reads* channels (the Bot API can't read
-third-party channels) and your own control bot that *commands* the copier.
+Put real messages from your channels into `parser/examples.py` before relying on the LLM
+parser. Run on testnet first. This is not financial advice.
 
-> Not financial advice. Trading perpetual futures can lose more than the stake; run on testnet first.
+## License
+
+MIT
