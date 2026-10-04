@@ -1,6 +1,6 @@
-# signal-copier
+# telegram-bybit-copier
 
-[![ci](https://github.com/faceitall123qwe-hub/signal-copier/actions/workflows/ci.yml/badge.svg)](https://github.com/faceitall123qwe-hub/signal-copier/actions/workflows/ci.yml)
+[![ci](https://github.com/faceitall123qwe-hub/telegram-bybit-copier/actions/workflows/ci.yml/badge.svg)](https://github.com/faceitall123qwe-hub/telegram-bybit-copier/actions/workflows/ci.yml)
 
 Reads trade signals from Telegram channels and places them on Bybit (USDT perpetuals). It
 manages the whole trade: entry, stop loss, a take-profit ladder, moving the stop to breakeven
